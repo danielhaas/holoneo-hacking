@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Flash the built firmware over USB serial (needs esptool on PATH and access to the port).
 set -euo pipefail
-PORT=${PORT:-/dev/ttyUSB0}
+PORT=${PORT:-/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0}
 B="$(dirname "$0")/../firmware/build"
 cd "$B"
 esptool -p "$PORT" -b 921600 --before default-reset --after hard-reset write-flash \

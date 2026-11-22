@@ -34,7 +34,7 @@ def set_lines(fd, on=0, off=0):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--port", default="/dev/ttyUSB0")
+    p.add_argument("--port", default="/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0")
     p.add_argument("--baud", type=int, default=115200)
     p.add_argument("--seconds", type=float, default=15)
     p.add_argument("--reset", action="store_true", help="reboot the board first")

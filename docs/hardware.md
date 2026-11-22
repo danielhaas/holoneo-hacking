@@ -54,5 +54,25 @@ read and rewritten over USB with `esptool`.
 - **Speaker:** ES8311 at I2C 0x18 via `esp_codec_dev`, amp enable GPIO39 — works.
 - **Microphones:** ES7210 at I2C 0x40, 4-slot TDM at 16 kHz; signal on slots 0 and 2, slots 1 and 3 silent.
 - **microSD:** mounts at 40 MHz in 1-bit mode.
-- **Gesture sensor:** the stock driver talks to an EPL2219 at 7-bit address 0x41 on the same bus
-  (100 kHz), but it does not ACK under our firmware — open question (power/enable path not found yet).
+- **Gesture sensor:** see below.
+
+## Gesture sensor (EPL2219, I2C 0x41)
+
+- Sits on the main I2C bus (17/18) at 7-bit address **0x41**. If it doesn't ACK at all (the stock
+  firmware then logs a flood of I2C NACKs), check/reseat its connector — on our unit it looked seated
+  but only worked after reseating.
+- **Data:** registers 0x26.. hold 8 records of 3 bytes; each record is a **20-bit value** in the top
+  bits of a big-endian 24-bit word. Odd records are channel B, even records channel A (record 0 is an
+  older A sample). Reading 0x26..0x2b gives the newest A and B. New samples arrive ~every 14 ms.
+  Baseline ≈ 22 000–25 000, a hand in front saturates at 1 048 575.
+- **Start-up** (recovered by comparing a cold sensor with one configured by the stock firmware):
+  1. write regs 0x00..0x0f = `0a 14 15 14 13 20 20 10 00 00 ff ff 00 00 ff ff`
+  2. write regs 0x24..0x25 = `17 6c` (without this it measures but barely reacts — LED drive/gain?)
+  3. write reg 0x11 = `02` (power-up value `03`; bit 0 looks like stop/power-down)
+  4. repeat steps 1–3 once more: starting the sensor from standby resets 0x24/0x25, so the
+     second pass (applied while running) is what makes it work after a cold power-up.
+- **What the two channels can tell:** both channels see nearly the same thing and B always trails
+  A by ~18 ms (sampling order), so **left vs right can't be distinguished**. Robust gestures are
+  *wave* (short burst, any direction) and *hover* (≥ 450 ms, saturated). *Bottom → top* shows a
+  stronger A than B with an early peak and is usable experimentally.
+  Implementation: `firmware/components/gesture/`.

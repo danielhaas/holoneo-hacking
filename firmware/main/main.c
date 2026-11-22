@@ -7,6 +7,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -22,6 +23,8 @@
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "board.h"
+#include "gesture.h"
+#include "freertos/queue.h"
 
 static const char *TAG = "probe";
 
@@ -323,29 +326,88 @@ static void rescan(const char *when)
     ESP_LOGI(TAG, "i2c rescan (%s): %s", when, o ? line : "none");
 }
 
+// Brute-force I2C scan over every pair of GPIOs not known to be in use, looking for the
+// gesture sensor in case it is wired to other pins than the stock firmware assumes.
+static void pin_hunt(void)
+{
+    const int cand[] = {0, 3, 5, 6, 12, 13, 19, 20, 40, 41, 42};
+    const int n = sizeof cand / sizeof cand[0];
+    ESP_LOGW(TAG, "pin hunt: %d candidate pins, %d pairs", n, n * (n - 1));
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) {
+            if (i == j) continue;
+            i2c_master_bus_handle_t bus;
+            i2c_master_bus_config_t cfg = {
+                .i2c_port = I2C_NUM_1, .sda_io_num = cand[i], .scl_io_num = cand[j],
+                .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7,
+                .flags.enable_internal_pullup = true,
+            };
+            if (i2c_new_master_bus(&cfg, &bus) != ESP_OK) continue;
+            char line[96]; int o = 0;
+            for (int a = 0x08; a < 0x78; a++)
+                if (i2c_master_probe(bus, a, 5) == ESP_OK) o += snprintf(line + o, sizeof line - o, "0x%02x ", a);
+            if (o) ESP_LOGW(TAG, "pin hunt: SDA=%d SCL=%d -> %s", cand[i], cand[j], line);
+            i2c_del_master_bus(bus);
+        }
+    ESP_LOGW(TAG, "pin hunt: done");
+}
+
+// ---------------------------------------------------------------- gesture demo
+static QueueHandle_t s_gq;
+
+static void on_gesture(gesture_t g, void *ctx) { xQueueSend(s_gq, &g, 0); }
+
+static void fill(uint16_t c)
+{
+    for (int i = 0; i < VIEW_W * BAND_LINES; i++) s_band[i] = c;
+    for (int y0 = 0; y0 < VIEW_H; y0 += BAND_LINES) {
+        esp_lcd_panel_draw_bitmap(s_panel, 0, y0, VIEW_W, y0 + BAND_LINES, s_band);
+        xSemaphoreTake(s_flush_done, portMAX_DELAY);
+    }
+}
+
 void app_main(void)
 {
-    ESP_LOGI(TAG, "=== Holoneo stage-0 probe, round 2 ===");
+    ESP_LOGI(TAG, "=== Holoneo: gesture demo (wave=green, hover=blue, up=magenta) ===");
     display_init();
     draw_test_pattern();
     i2c_scan();
-    speaker_init();
-    rescan("after ES8311 + PA enable");
-    mic_test();
-    rescan("after ES7210");
-    gesture_probe();
-
-    // Loop so the user can watch/listen at leisure: beeps, then backlight off/on.
-    for (int round = 1;; round++) {
-        ESP_LOGW(TAG, "---- round %d ----", round);
-        beep3();
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        ESP_LOGW(TAG, "backlight GPIO38=0 (3 s)");
-        gpio_set_level(BOARD_LCD_BL, 0);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        ESP_LOGW(TAG, "backlight GPIO38=1 (3 s)");
-        gpio_set_level(BOARD_LCD_BL, 1);
-        vTaskDelay(pdMS_TO_TICKS(3000));
-        if (round % 3 == 0) { rescan("periodic"); gesture_probe(); }
+    {
+        i2c_master_dev_handle_t d;
+        i2c_device_config_t dc = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = 0x41, .scl_speed_hz = 100000 };
+        if (i2c_master_bus_add_device(s_i2c, &dc, &d) == ESP_OK) {
+            for (int k = 0; k < 2; k++) {
+                uint8_t r = 0, v[0x40];
+                if (i2c_master_transmit_receive(d, &r, 1, v, sizeof v, 50) == ESP_OK) {
+                    char line[3 * 0x40 + 1]; int o = 0;
+                    for (int i = 0; i < 0x40; i++) o += snprintf(line + o, sizeof line - o, "%02x ", v[i]);
+                    ESP_LOGI(TAG, "epl regs: %s", line);
+                }
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+            i2c_master_bus_rm_device(d);
+        }
+    }
+    s_gq = xQueueCreate(4, sizeof(gesture_t));
+    if (gesture_start(s_i2c, on_gesture, NULL) != ESP_OK) return;
+    {   // log the register state after init, for cold-start diagnosis
+        i2c_master_dev_handle_t d;
+        i2c_device_config_t dc = { .dev_addr_length = I2C_ADDR_BIT_LEN_7, .device_address = 0x41, .scl_speed_hz = 100000 };
+        if (i2c_master_bus_add_device(s_i2c, &dc, &d) == ESP_OK) {
+            uint8_t r = 0, v[0x28];
+            if (i2c_master_transmit_receive(d, &r, 1, v, sizeof v, 50) == ESP_OK) {
+                char line[3 * 0x28 + 1]; int o = 0;
+                for (int i = 0; i < 0x28; i++) o += snprintf(line + o, sizeof line - o, "%02x ", v[i]);
+                ESP_LOGI(TAG, "epl regs after init: %s", line);
+            }
+            i2c_master_bus_rm_device(d);
+        }
+    }
+    for (;;) {
+        gesture_t g;
+        xQueueReceive(s_gq, &g, portMAX_DELAY);
+        fill(g == GESTURE_WAVE ? rgb565(0, 200, 0) : g == GESTURE_HOVER ? rgb565(0, 0, 255) : rgb565(255, 0, 255));
+        vTaskDelay(pdMS_TO_TICKS(400));
+        draw_test_pattern();
     }
 }
