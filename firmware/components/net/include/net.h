@@ -14,6 +14,7 @@ net_state_t net_state(void);
 const char *net_ip(void);          // "" if not connected
 const char *net_ssid(void);        // configured station SSID ("" if none)
 int net_rssi(void);
+void net_ap_info(char *bssid, size_t n, int *channel);   // access point we are connected to
 // Saves new station credentials and reconnects.
 esp_err_t net_set_wifi(const char *ssid, const char *password);
 // Random per-device API token (generated on first boot, stored in NVS). Also the setup-AP password.

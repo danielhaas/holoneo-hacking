@@ -115,6 +115,11 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddStringToObject(j, "hostname", NET_HOSTNAME ".local");
     cJSON_AddStringToObject(j, "ip", net_ip());
     cJSON_AddNumberToObject(j, "rssi", net_rssi());
+    char bssid[20];
+    int ch;
+    net_ap_info(bssid, sizeof bssid, &ch);
+    cJSON_AddStringToObject(j, "bssid", bssid);
+    cJSON_AddNumberToObject(j, "channel", ch);
     cJSON_AddNumberToObject(j, "uptime_s", esp_timer_get_time() / 1000000);
     cJSON_AddNumberToObject(j, "free_heap", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(j, "free_psram", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));

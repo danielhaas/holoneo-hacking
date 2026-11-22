@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_wifi.h"
+#include "esp_mac.h"
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_random.h"
@@ -22,6 +23,18 @@ static net_state_t s_state = NET_CONNECTING;
 static char s_ip[16], s_ssid[33], s_token[17];
 static int s_retries;
 static esp_netif_t *s_sta, *s_ap;
+
+// With a mesh (several APs with the same SSID) the default fast scan joins the first AP that
+// answers, often a far one, and ESP-IDF never roams on its own. Scan all channels, join the
+// strongest, and let the mesh steer us (802.11k neighbour reports, 802.11v BSS transition).
+static void prefer_strongest_ap(wifi_config_t *sta)
+{
+    sta->sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta->sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    sta->sta.bssid_set = false;
+    sta->sta.rm_enabled = 1;
+    sta->sta.btm_enabled = 1;
+}
 
 static void load_token(void)
 {
@@ -48,6 +61,16 @@ int net_rssi(void)
 {
     wifi_ap_record_t ap;
     return esp_wifi_sta_get_ap_info(&ap) == ESP_OK ? ap.rssi : 0;
+}
+
+void net_ap_info(char *bssid, size_t n, int *channel)
+{
+    wifi_ap_record_t ap;
+    *channel = 0;
+    bssid[0] = 0;
+    if (esp_wifi_sta_get_ap_info(&ap) != ESP_OK) return;
+    snprintf(bssid, n, MACSTR, MAC2STR(ap.bssid));
+    *channel = ap.primary;
 }
 
 static void start_setup_ap(void)
@@ -84,6 +107,9 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         if (s_state == NET_SETUP_AP) { esp_wifi_set_mode(WIFI_MODE_STA); ESP_LOGI(TAG, "setup AP off"); }
         s_state = NET_CONNECTED;
         xEventGroupSetBits(s_ev, BIT_CONNECTED);
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK)
+            ESP_LOGI(TAG, "access point " MACSTR ", channel %d, RSSI %d dBm", MAC2STR(ap.bssid), ap.primary, ap.rssi);
         ESP_LOGI(TAG, "connected to '%s', IP %s, http://%s.local/", s_ssid, s_ip, NET_HOSTNAME);
     }
 }
@@ -109,6 +135,10 @@ esp_err_t net_start(void)
     strlcpy(s_ssid, (char *)sta.sta.ssid, sizeof s_ssid);
     ESP_LOGI(TAG, "saved station SSID: %s", s_ssid[0] ? "(set)" : "(none)");
     esp_wifi_set_mode(WIFI_MODE_STA);
+    if (s_ssid[0]) {
+        prefer_strongest_ap(&sta);
+        esp_wifi_set_config(WIFI_IF_STA, &sta);
+    }
     esp_wifi_set_ps(WIFI_PS_NONE);   // USB powered: favour latency over power
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "wifi start");
 
@@ -133,6 +163,7 @@ esp_err_t net_set_wifi(const char *ssid, const char *password)
     strlcpy((char *)sta.sta.password, password ? password : "", sizeof sta.sta.password);
     sta.sta.threshold.authmode = password && password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     sta.sta.pmf_cfg.capable = true;
+    prefer_strongest_ap(&sta);
     strlcpy(s_ssid, ssid, sizeof s_ssid);
     s_retries = 0;
     esp_wifi_disconnect();

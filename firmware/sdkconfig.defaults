@@ -19,8 +19,9 @@ CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_APP_PROJECT_VER_FROM_CONFIG=n
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
-# Wi-Fi / TCP throughput (defaults give ~150 KB/s; live streaming needs more). Buffers may live in PSRAM.
-CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+# Wi-Fi / TCP throughput. Keep the Wi-Fi/lwIP buffers in internal RAM: in PSRAM they compete with
+# the frame buffers and downloads collapse (~460 -> ~66 KB/s) while animations run.
+# CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP is not set
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=64
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=64
@@ -35,3 +36,6 @@ CONFIG_LWIP_UDP_RECVMBOX_SIZE=64
 CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE=16
 CONFIG_LWIP_WND_SCALE=y
 CONFIG_LWIP_TCP_RCV_SCALE=3
+CONFIG_LWIP_TCP_SACK_OUT=y
+# mesh networks: 802.11k/v so the mesh can steer the device to the nearest access point
+CONFIG_ESP_WIFI_11KV_SUPPORT=y
