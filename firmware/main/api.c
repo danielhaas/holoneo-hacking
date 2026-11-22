@@ -21,6 +21,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include "api.h"
+#include "setup_page.h"
 
 static const char *TAG = "api";
 static httpd_handle_t s_server;
@@ -33,6 +34,7 @@ static api_status_cb_t s_status_cb;
 // ------------------------------------------------------------------ helpers
 static bool authorized(httpd_req_t *req)
 {
+    if (net_is_setup_client(httpd_req_to_sockfd(req))) return true;
     char hdr[64], q[96], tok[32];
     if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof hdr) == ESP_OK &&
         strncmp(hdr, "Bearer ", 7) == 0 && strcmp(hdr + 7, net_token()) == 0) return true;
@@ -113,7 +115,9 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddStringToObject(j, "device", "holoneo");
     cJSON_AddStringToObject(j, "version", esp_app_get_description()->version);
     cJSON_AddStringToObject(j, "hostname", NET_HOSTNAME ".local");
-    cJSON_AddStringToObject(j, "ip", net_ip());
+    cJSON_AddStringToObject(j, "ip", net_state() == NET_CONNECTED ? net_ip() : "");
+    cJSON_AddStringToObject(j, "ssid", net_state() == NET_CONNECTED ? net_ssid() : "");
+    cJSON_AddBoolToObject(j, "setup_mode", net_state() == NET_SETUP_AP);
     cJSON_AddNumberToObject(j, "rssi", net_rssi());
     char bssid[20];
     int ch;
@@ -253,16 +257,81 @@ static esp_err_t h_mic(httpd_req_t *req)
 static esp_err_t h_wifi(httpd_req_t *req)
 {
     REQUIRE_AUTH(req);
+    if (req->method == HTTP_GET) {
+        char ssids[NET_MAX_NETWORKS][33];
+        int n = net_saved(ssids, NET_MAX_NETWORKS);
+        cJSON *j = cJSON_CreateObject(), *arr = cJSON_AddArrayToObject(j, "saved");
+        for (int i = 0; i < n; i++) cJSON_AddItemToArray(arr, cJSON_CreateString(ssids[i]));
+        cJSON_AddStringToObject(j, "connected", net_state() == NET_CONNECTED ? net_ssid() : "");
+        cJSON_AddNumberToObject(j, "max", NET_MAX_NETWORKS);
+        return send_json(req, j);
+    }
+    if (req->method == HTTP_DELETE) {
+        char q[128], ssid[64];
+        if (httpd_req_get_url_query_str(req, q, sizeof q) != ESP_OK || httpd_query_key_value(q, "ssid", ssid, sizeof ssid) != ESP_OK)
+            return send_error(req, "400 Bad Request", "need ?ssid=...");
+        // query values arrive URL-encoded: decode %XX and +
+        char dec[33]; int o = 0;
+        for (char *p = ssid; *p && o < 32; p++) {
+            if (*p == '%' && p[1] && p[2]) { char h[3] = {p[1], p[2], 0}; dec[o++] = strtol(h, NULL, 16); p += 2; }
+            else dec[o++] = *p == '+' ? ' ' : *p;
+        }
+        dec[o] = 0;
+        if (net_forget_wifi(dec) != ESP_OK) return send_error(req, "404 Not Found", "no such saved network");
+        return send_ok(req);
+    }
     size_t len;
     char *body = (char *)read_body(req, 512, &len);
     cJSON *j = body ? cJSON_Parse(body) : NULL;
     free(body);
     const cJSON *ssid = cJSON_GetObjectItem(j, "ssid"), *pw = cJSON_GetObjectItem(j, "password");
     if (!cJSON_IsString(ssid) || !ssid->valuestring[0]) { cJSON_Delete(j); return send_error(req, "400 Bad Request", "need {\"ssid\":..,\"password\":..}"); }
-    send_ok(req);
-    net_set_wifi(ssid->valuestring, cJSON_IsString(pw) ? pw->valuestring : "");
+    esp_err_t e = net_set_wifi(ssid->valuestring, cJSON_IsString(pw) ? pw->valuestring : "");
     cJSON_Delete(j);
-    return ESP_OK;
+    if (e != ESP_OK) return send_error(req, "400 Bad Request", "SSID max 32, password max 64 characters");
+    return send_ok(req);
+}
+
+static esp_err_t h_wifi_scan(httpd_req_t *req)
+{
+    REQUIRE_AUTH(req);
+    net_scan_result_t *r = calloc(24, sizeof *r);
+    if (!r) return send_error(req, "500 Internal Server Error", "out of memory");
+    int n = net_scan(r, 24);
+    // strongest first
+    for (int i = 1; i < n; i++) for (int k = i; k > 0 && r[k].rssi > r[k - 1].rssi; k--) {
+        net_scan_result_t t = r[k]; r[k] = r[k - 1]; r[k - 1] = t;
+    }
+    cJSON *arr = cJSON_CreateArray();
+    for (int i = 0; i < n; i++) {
+        cJSON *o = cJSON_CreateObject();
+        cJSON_AddStringToObject(o, "ssid", r[i].ssid);
+        cJSON_AddNumberToObject(o, "rssi", r[i].rssi);
+        cJSON_AddBoolToObject(o, "secure", r[i].secure);
+        cJSON_AddBoolToObject(o, "saved", r[i].saved);
+        cJSON_AddItemToArray(arr, o);
+    }
+    free(r);
+    return send_json(req, arr);
+}
+
+static esp_err_t h_page(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, SETUP_PAGE, sizeof SETUP_PAGE - 1);
+}
+
+// Anything unknown: on the setup network send phones' connectivity checks to the setup page
+// (captive portal); otherwise a plain 404.
+static esp_err_t h_fallback(httpd_req_t *req)
+{
+    if (net_state() == NET_SETUP_AP) {
+        httpd_resp_set_status(req, "302 Found");
+        httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
+        return httpd_resp_send(req, NULL, 0);
+    }
+    return send_error(req, "404 Not Found", "unknown path");
 }
 
 static void restart_later(void *arg) { vTaskDelay(pdMS_TO_TICKS(500)); esp_restart(); }
@@ -472,7 +541,7 @@ esp_err_t api_start(api_status_cb_t status_cb)
 {
     s_status_cb = status_cb;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 24;
+    cfg.max_uri_handlers = 28;
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = 8192;
     cfg.recv_wait_timeout = 20;
@@ -481,7 +550,7 @@ esp_err_t api_start(api_status_cb_t status_cb)
     if (httpd_start(&s_server, &cfg) != ESP_OK) return ESP_FAIL;
     const httpd_uri_t uris[] = {
         { .uri = "/status",    .method = HTTP_GET,  .handler = h_status },
-        { .uri = "/",          .method = HTTP_GET,  .handler = h_status },
+        { .uri = "/",          .method = HTTP_GET,  .handler = h_page },
         { .uri = "/image",     .method = HTTP_POST, .handler = h_image },
         { .uri = "/text",      .method = HTTP_POST, .handler = h_text },
         { .uri = "/fill",      .method = HTTP_POST, .handler = h_fill },
@@ -490,6 +559,9 @@ esp_err_t api_start(api_status_cb_t status_cb)
         { .uri = "/audio",     .method = HTTP_POST, .handler = h_audio },
         { .uri = "/mic",       .method = HTTP_GET,  .handler = h_mic },
         { .uri = "/wifi",      .method = HTTP_POST, .handler = h_wifi },
+        { .uri = "/wifi",      .method = HTTP_GET,  .handler = h_wifi },
+        { .uri = "/wifi",      .method = HTTP_DELETE, .handler = h_wifi },
+        { .uri = "/wifi/scan", .method = HTTP_GET,  .handler = h_wifi_scan },
         { .uri = "/reboot",    .method = HTTP_POST, .handler = h_reboot },
         { .uri = "/ota",       .method = HTTP_POST, .handler = h_ota },
         { .uri = "/ws",        .method = HTTP_GET,  .handler = h_ws, .is_websocket = true },
@@ -500,6 +572,8 @@ esp_err_t api_start(api_status_cb_t status_cb)
         { .uri = "/files/*",   .method = HTTP_DELETE, .handler = h_files },
     };
     for (size_t i = 0; i < sizeof uris / sizeof uris[0]; i++) httpd_register_uri_handler(s_server, &uris[i]);
+    const httpd_uri_t fallback = { .uri = "/*", .method = HTTP_GET, .handler = h_fallback };   // must be last
+    httpd_register_uri_handler(s_server, &fallback);
     ESP_LOGI(TAG, "HTTP API on port 80");
     return ESP_OK;
 }

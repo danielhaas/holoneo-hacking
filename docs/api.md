@@ -1,11 +1,19 @@
 # Custom firmware: HTTP API
 
-The firmware joins the Wi-Fi network saved on the device (it reuses the one the stock firmware
-stored) and is reachable as **`http://holoneo.local/`** (mDNS) on port 80.
+The firmware is reachable as **`http://holoneo.local/`** (mDNS) on port 80. Opening that address
+in a browser shows a small **status and Wi-Fi setup page**.
 
-If no network is saved or it can't connect for ~10 attempts, it opens a WPA2 access point
-**`Holoneo-setup`** whose password is the API token (shown on the screen). Then use
-`POST /wifi` at `http://192.168.4.1/`.
+## Wi-Fi
+
+- Up to **5 networks** are saved. At start-up (and after losing the connection) the device scans
+  and joins the **strongest saved network in range**; within a mesh it picks the nearest access
+  point and accepts 802.11k/v steering. On first boot it adopts the network the stock firmware
+  had saved.
+- If no saved network is in range, it opens the WPA2 network **`Holoneo-setup`** (password = the
+  API token, shown on the screen) and keeps looking in the background. Join it with a phone: the
+  **setup page opens by itself** (captive portal). There, pick a network, enter its password,
+  save — the device switches over and the setup network disappears. Clients on the setup network
+  need no token (they already proved they know it).
 
 ## Token
 
@@ -25,7 +33,7 @@ A="Authorization: Bearer $HOLO_TOKEN"
 
 | Method & path | Body / query | Does |
 |---|---|---|
-| `GET /status` | – | JSON: version, IP, RSSI, uptime, free memory, volume, gesture count (no token needed) |
+| `GET /status` | – | JSON: version, IP, SSID, RSSI, access point (bssid/channel), uptime, free memory, volume, gestures (no token needed) |
 | `POST /text` | text body; `?size=1..4&color=RRGGBB&bg=RRGGBB` | clears the screen and shows word-wrapped, centred text |
 | `POST /image` | baseline JPEG (≤ 2 MB) | scales down by 1/2, 1/4, 1/8 until it fits 320×240, centres on black |
 | `POST /fill` | `?color=RRGGBB` | fills the screen |
@@ -38,7 +46,11 @@ A="Authorization: Bearer $HOLO_TOKEN"
 | `GET /files/<path>` | e.g. `/files/data`, `/files/sd/Video` | lists a directory (JSON) or downloads a file |
 | `PUT /files/<path>` | file body | stores a file under `/data` (internal flash, ~10 MB) or `/sd` |
 | `DELETE /files/<path>` | – | deletes a file or empty directory |
-| `POST /wifi` | `{"ssid":"...","password":"..."}` | saves a new network and reconnects |
+| `GET /` | – | status + Wi-Fi setup page (HTML) |
+| `GET /wifi` | – | saved networks (no passwords) and the one in use |
+| `POST /wifi` | `{"ssid":"...","password":"..."}` | saves a network (max 5, oldest dropped) and switches to it |
+| `DELETE /wifi` | `?ssid=...` | forgets a saved network |
+| `GET /wifi/scan` | – | nearby networks: `ssid`, `rssi`, `secure`, `saved` (strongest first) |
 | `POST /ota` | firmware image (`firmware/build/holoneo.bin`) | updates over Wi-Fi and reboots; rolls back automatically if the new build never gets on Wi-Fi |
 | `POST /reboot` | – | reboots |
 | `GET /ws?token=...` | WebSocket | pushes events as JSON text frames, e.g. `{"type":"gesture","gesture":"WAVE"}`; **binary frames you send are shown as JPEG frames** (live streaming, up to 30 fps) |
