@@ -10,6 +10,7 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_vendor.h"
 #include "jpeg_decoder.h"
+#include "esp_jpeg_dec.h"
 #include "board.h"
 #include "display.h"
 #include "font_mono20.h"
@@ -19,9 +20,9 @@ static const char *TAG = "display";
 #define BAND_LINES 40
 
 static esp_lcd_panel_handle_t s_panel;
-static SemaphoreHandle_t s_flush_done, s_mutex;
-static uint16_t *s_fb;     // PSRAM, DISPLAY_W*DISPLAY_H, big-endian RGB565 (panel byte order)
-static uint16_t *s_band;   // internal DMA RAM, one band
+static SemaphoreHandle_t s_band_free, s_mutex, s_present_lock;
+static uint16_t *s_fb;       // PSRAM, DISPLAY_W*DISPLAY_H, big-endian RGB565 (panel byte order)
+static uint16_t *s_band[2];  // internal DMA RAM: copy one band while the other is being sent
 
 static inline uint16_t be565(uint32_t rgb)
 {
@@ -33,7 +34,7 @@ static inline uint16_t be565(uint32_t rgb)
 static bool on_flush_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *e, void *ctx)
 {
     BaseType_t woken = pdFALSE;
-    xSemaphoreGiveFromISR(s_flush_done, &woken);
+    xSemaphoreGiveFromISR(s_band_free, &woken);
     return woken == pdTRUE;
 }
 
@@ -45,10 +46,12 @@ void display_backlight(bool on) { gpio_set_level(BOARD_LCD_BL, on); }
 esp_err_t display_init(void)
 {
     s_mutex = xSemaphoreCreateRecursiveMutex();
-    s_flush_done = xSemaphoreCreateBinary();
-    s_fb = heap_caps_calloc(DISPLAY_W * DISPLAY_H, 2, MALLOC_CAP_SPIRAM);
-    s_band = heap_caps_malloc(DISPLAY_W * BAND_LINES * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-    ESP_RETURN_ON_FALSE(s_fb && s_band, ESP_ERR_NO_MEM, TAG, "framebuffer alloc");
+    s_present_lock = xSemaphoreCreateMutex();
+    s_band_free = xSemaphoreCreateCounting(2, 2);
+    s_fb = heap_caps_aligned_calloc(16, DISPLAY_W * DISPLAY_H, 2, MALLOC_CAP_SPIRAM);
+    s_band[0] = heap_caps_malloc(DISPLAY_W * BAND_LINES * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    s_band[1] = heap_caps_malloc(DISPLAY_W * BAND_LINES * 2, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    ESP_RETURN_ON_FALSE(s_fb && s_band[0] && s_band[1], ESP_ERR_NO_MEM, TAG, "framebuffer alloc");
 
     gpio_config_t out = { .pin_bit_mask = (1ULL << BOARD_LCD_AUX) | (1ULL << BOARD_LCD_BL), .mode = GPIO_MODE_OUTPUT };
     gpio_config(&out);
@@ -63,7 +66,7 @@ esp_err_t display_init(void)
     esp_lcd_panel_io_handle_t io;
     esp_lcd_panel_io_spi_config_t io_cfg = {
         .cs_gpio_num = BOARD_LCD_CS, .dc_gpio_num = BOARD_LCD_DC, .spi_mode = 0,
-        .pclk_hz = 40 * 1000 * 1000, .trans_queue_depth = 4,
+        .pclk_hz = DISPLAY_SPI_HZ, .trans_queue_depth = 4,
         .lcd_cmd_bits = 8, .lcd_param_bits = 8, .on_color_trans_done = on_flush_done,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)BOARD_LCD_HOST, &io_cfg, &io), TAG, "io");
@@ -82,14 +85,25 @@ esp_err_t display_init(void)
     return ESP_OK;
 }
 
+void display_present(const uint16_t *buf)
+{
+    xSemaphoreTake(s_present_lock, portMAX_DELAY);
+    for (int i = 0, y0 = 0; y0 < DISPLAY_H; y0 += BAND_LINES, i ^= 1) {
+        xSemaphoreTake(s_band_free, portMAX_DELAY);          // band buffer i is no longer being sent
+        memcpy(s_band[i], buf + y0 * DISPLAY_W, DISPLAY_W * BAND_LINES * 2);
+        esp_lcd_panel_draw_bitmap(s_panel, 0, y0, DISPLAY_W, y0 + BAND_LINES, s_band[i]);
+    }
+    xSemaphoreTake(s_band_free, portMAX_DELAY);              // wait until both bands are sent
+    xSemaphoreTake(s_band_free, portMAX_DELAY);
+    xSemaphoreGive(s_band_free);
+    xSemaphoreGive(s_band_free);
+    xSemaphoreGive(s_present_lock);
+}
+
 void display_flush(void)
 {
     display_lock();
-    for (int y0 = 0; y0 < DISPLAY_H; y0 += BAND_LINES) {
-        memcpy(s_band, s_fb + y0 * DISPLAY_W, DISPLAY_W * BAND_LINES * 2);
-        esp_lcd_panel_draw_bitmap(s_panel, 0, y0, DISPLAY_W, y0 + BAND_LINES, s_band);
-        xSemaphoreTake(s_flush_done, portMAX_DELAY);
-    }
+    display_present(s_fb);
     display_unlock();
 }
 
@@ -179,21 +193,34 @@ void display_text_centered(const char *s, uint32_t rgb, int scale)
     display_unlock();
 }
 
-esp_err_t display_jpeg(const uint8_t *jpg, size_t len)
+esp_err_t display_jpeg_decode(uint16_t *dst, const uint8_t *jpg, size_t len)
 {
     esp_jpeg_image_cfg_t cfg = { .indata = (uint8_t *)jpg, .indata_size = len, .out_format = JPEG_IMAGE_FORMAT_RGB565,
                                  .flags.swap_color_bytes = 1 };
     esp_jpeg_image_output_t info;
-    ESP_RETURN_ON_ERROR(esp_jpeg_get_image_info(&cfg, &info), TAG, "not a baseline JPEG");
+    if (esp_jpeg_get_image_info(&cfg, &info) != ESP_OK) return ESP_ERR_INVALID_ARG;
+    // Fast path: exactly screen-sized -> SIMD decoder (esp_new_jpeg) straight into the
+    // destination, which must be 16-byte aligned. ~4x faster than the generic decoder.
+    if (info.width == DISPLAY_W && info.height == DISPLAY_H && ((uintptr_t)dst & 15) == 0) {
+        jpeg_dec_config_t dc = DEFAULT_JPEG_DEC_CONFIG();
+        dc.output_type = JPEG_PIXEL_FORMAT_RGB565_BE;
+        jpeg_dec_handle_t h;
+        if (jpeg_dec_open(&dc, &h) != JPEG_ERR_OK) return ESP_FAIL;
+        jpeg_dec_io_t io = { .inbuf = (uint8_t *)jpg, .inbuf_len = len, .outbuf = (uint8_t *)dst };
+        jpeg_dec_header_info_t hi;
+        jpeg_error_t je = jpeg_dec_parse_header(h, &io, &hi);
+        if (je == JPEG_ERR_OK) je = jpeg_dec_process(h, &io);
+        jpeg_dec_close(h);
+        return je == JPEG_ERR_OK ? ESP_OK : ESP_FAIL;
+    }
     static const esp_jpeg_image_scale_t scales[] = { JPEG_IMAGE_SCALE_0, JPEG_IMAGE_SCALE_1_2, JPEG_IMAGE_SCALE_1_4, JPEG_IMAGE_SCALE_1_8 };
     int si = 0;
     while (si < 3 && ((info.width >> si) > DISPLAY_W || (info.height >> si) > DISPLAY_H)) si++;
     cfg.out_scale = scales[si];
-    int w = info.width >> si, h = info.height >> si;
     // decoder output is rounded up to whole MCUs (16 px)
     size_t out_size = ((info.width + 15) / 16 * 16 >> si) * ((info.height + 15) / 16 * 16 >> si) * 2 + 64;
     uint8_t *out = heap_caps_malloc(out_size, MALLOC_CAP_SPIRAM);
-    ESP_RETURN_ON_FALSE(out, ESP_ERR_NO_MEM, TAG, "jpeg buffer");
+    if (!out) return ESP_ERR_NO_MEM;
     cfg.outbuf = out;
     cfg.outbuf_size = out_size;
     esp_jpeg_image_output_t res;
@@ -202,14 +229,19 @@ esp_err_t display_jpeg(const uint8_t *jpg, size_t len)
         int ow = res.width, oh = res.height;
         int dw = ow < DISPLAY_W ? ow : DISPLAY_W, dh = oh < DISPLAY_H ? oh : DISPLAY_H;
         int dx = (DISPLAY_W - dw) / 2, dy = (DISPLAY_H - dh) / 2, sx = (ow - dw) / 2, sy = (oh - dh) / 2;
-        display_lock();
-        memset(s_fb, 0, DISPLAY_W * DISPLAY_H * 2);
+        memset(dst, 0, DISPLAY_W * DISPLAY_H * 2);
         for (int y = 0; y < dh; y++)
-            memcpy(s_fb + (dy + y) * DISPLAY_W + dx, (uint16_t *)out + (sy + y) * ow + sx, dw * 2);
-        display_unlock();
-        ESP_LOGI(TAG, "jpeg %dx%d shown at %dx%d (scale 1/%d)", info.width, info.height, w, h, 1 << si);
+            memcpy(dst + (dy + y) * DISPLAY_W + dx, (uint16_t *)out + (sy + y) * ow + sx, dw * 2);
     }
     free(out);
+    return err;
+}
+
+esp_err_t display_jpeg(const uint8_t *jpg, size_t len)
+{
+    display_lock();
+    esp_err_t err = display_jpeg_decode(s_fb, jpg, len);
+    display_unlock();
     return err;
 }
 

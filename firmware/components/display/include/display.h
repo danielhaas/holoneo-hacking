@@ -10,6 +10,9 @@
 
 #define DISPLAY_W 320
 #define DISPLAY_H 240
+#ifndef DISPLAY_SPI_HZ
+#define DISPLAY_SPI_HZ (60 * 1000 * 1000)   // stock firmware uses 60 MHz
+#endif
 
 esp_err_t display_init(void);
 void display_backlight(bool on);
@@ -28,6 +31,10 @@ void display_text_centered(const char *s, uint32_t rgb, int scale);
 esp_err_t display_jpeg(const uint8_t *jpg, size_t len);
 // Copies the framebuffer to the panel.
 void display_flush(void);
+// Sends any 320x240 big-endian RGB565 buffer to the panel (bypasses the framebuffer).
+void display_present(const uint16_t *buf);
+// Decodes a JPEG into a 320x240 buffer (scaled to fit, centred on black).
+esp_err_t display_jpeg_decode(uint16_t *dst, const uint8_t *jpg, size_t len);
 
 // Save / restore the whole framebuffer (e.g. to show an overlay temporarily).
 void display_snapshot(void);

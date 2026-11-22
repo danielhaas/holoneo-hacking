@@ -14,6 +14,12 @@
 #include "display.h"
 #include "audio.h"
 #include "net.h"
+#include "anim.h"
+#include "storage.h"
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
 #include "api.h"
 
 static const char *TAG = "api";
@@ -113,6 +119,13 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddNumberToObject(j, "free_heap", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(j, "free_psram", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     cJSON_AddNumberToObject(j, "volume", audio_get_volume());
+    cJSON_AddBoolToObject(j, "playing", anim_playing());
+    cJSON_AddNumberToObject(j, "fps", (int)(anim_fps() * 10) / 10.0);
+    cJSON_AddBoolToObject(j, "sd_card", storage_sd_present());
+    size_t used, total;
+    storage_data_usage(&used, &total);
+    cJSON_AddNumberToObject(j, "data_used_kb", used / 1024);
+    cJSON_AddNumberToObject(j, "data_total_kb", total / 1024);
     if (s_status_cb) s_status_cb(j);
     return send_json(req, j);
 }
@@ -120,6 +133,7 @@ static esp_err_t h_status(httpd_req_t *req)
 static esp_err_t h_image(httpd_req_t *req)
 {
     REQUIRE_AUTH(req);
+    anim_stop();
     size_t len;
     uint8_t *jpg = read_body(req, MAX_IMAGE, &len);
     if (!jpg) return send_error(req, "413 Payload Too Large", "body missing or larger than 2 MB");
@@ -133,6 +147,7 @@ static esp_err_t h_image(httpd_req_t *req)
 static esp_err_t h_text(httpd_req_t *req)
 {
     REQUIRE_AUTH(req);
+    anim_stop();
     size_t len;
     char *txt = (char *)read_body(req, MAX_TEXT, &len);
     if (!txt) return send_error(req, "400 Bad Request", "body must be 1..2048 bytes of text");
@@ -150,6 +165,7 @@ static esp_err_t h_text(httpd_req_t *req)
 static esp_err_t h_fill(httpd_req_t *req)
 {
     REQUIRE_AUTH(req);
+    anim_stop();
     display_fill(query_color(req, "color", 0x000000));
     display_flush();
     return send_ok(req);
@@ -282,7 +298,138 @@ static esp_err_t h_ota(httpd_req_t *req)
     return ESP_OK;
 }
 
+// ------------------------------------------------------------------ animation & files
+#define MAX_CLIP (6 * 1024 * 1024)
+
+// Accepts only /data/... and /sd/... without "..". Writes the filesystem path into out.
+static bool safe_path(const char *p, char *out, size_t n)
+{
+    if (strncmp(p, "/data", 5) && strncmp(p, "/sd", 3)) return false;
+    if (strstr(p, "..")) return false;
+    strlcpy(out, p, n);
+    size_t l = strlen(out);
+    while (l > 1 && out[l - 1] == '/') out[--l] = 0;   // no trailing slash
+    return true;
+}
+
+static esp_err_t h_play(httpd_req_t *req)
+{
+    REQUIRE_AUTH(req);
+    char q[192], raw[128], path[128];
+    bool loop = query_int(req, "loop", 1) != 0;
+    int fps = query_int(req, "fps", 0);
+    if (httpd_req_get_url_query_str(req, q, sizeof q) == ESP_OK && httpd_query_key_value(q, "path", raw, sizeof raw) == ESP_OK) {
+        if (!safe_path(raw, path, sizeof path)) return send_error(req, "400 Bad Request", "path must be under /data or /sd");
+        struct stat st;
+        if (stat(path, &st) != 0) return send_error(req, "404 Not Found", "no such file");
+        if (anim_play_file(path, loop, fps) != ESP_OK) return send_error(req, "500 Internal Server Error", "player busy");
+        return send_ok(req);
+    }
+    size_t len;
+    uint8_t *clip = read_body(req, MAX_CLIP, &len);
+    if (!clip) return send_error(req, "400 Bad Request", "give ?path=... or upload an AVI/MJPEG clip (<= 6 MB)");
+    if (anim_play_mem(clip, len, loop, fps) != ESP_OK) return send_error(req, "500 Internal Server Error", "player busy");
+    return send_ok(req);
+}
+
+static esp_err_t h_stop(httpd_req_t *req)
+{
+    REQUIRE_AUTH(req);
+    anim_stop();
+    return send_ok(req);
+}
+
+static esp_err_t mkdirs(const char *path)
+{
+    char tmp[128];
+    strlcpy(tmp, path, sizeof tmp);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+        if (strcmp(tmp, "/data") && strcmp(tmp, "/sd")) mkdir(tmp, 0775);
+        *p = '/';
+    }
+    return ESP_OK;
+}
+
+// GET /files/<dir> lists, GET /files/<file> downloads, PUT uploads, DELETE removes.
+static esp_err_t h_files(httpd_req_t *req)
+{
+    REQUIRE_AUTH(req);
+    char path[128], uri[160];
+    strlcpy(uri, req->uri + strlen("/files"), sizeof uri);
+    char *qm = strchr(uri, '?');
+    if (qm) *qm = 0;
+    if (!safe_path(uri, path, sizeof path)) return send_error(req, "400 Bad Request", "path must be under /files/data or /files/sd");
+    struct stat st;
+    bool exists = stat(path, &st) == 0;
+
+    if (req->method == HTTP_GET) {
+        if (!exists) return send_error(req, "404 Not Found", "no such file or directory");
+        if (S_ISDIR(st.st_mode)) {
+            DIR *d = opendir(path);
+            if (!d) return send_error(req, "500 Internal Server Error", "can't list");
+            cJSON *arr = cJSON_CreateArray();
+            struct dirent *e;
+            while ((e = readdir(d))) {
+                char full[400];
+                snprintf(full, sizeof full, "%s/%s", path, e->d_name);
+                struct stat es;
+                cJSON *o = cJSON_CreateObject();
+                cJSON_AddStringToObject(o, "name", e->d_name);
+                bool dir = e->d_type == DT_DIR;
+                cJSON_AddBoolToObject(o, "dir", dir);
+                if (!dir && stat(full, &es) == 0) cJSON_AddNumberToObject(o, "size", es.st_size);
+                cJSON_AddItemToArray(arr, o);
+            }
+            closedir(d);
+            return send_json(req, arr);
+        }
+        FILE *f = fopen(path, "rb");
+        if (!f) return send_error(req, "500 Internal Server Error", "can't open");
+        httpd_resp_set_type(req, "application/octet-stream");
+        char *buf = malloc(4096);
+        size_t n;
+        while ((n = fread(buf, 1, 4096, f)) > 0)
+            if (httpd_resp_send_chunk(req, buf, n) != ESP_OK) break;
+        free(buf);
+        fclose(f);
+        return httpd_resp_send_chunk(req, NULL, 0);
+    }
+    if (req->method == HTTP_DELETE) {
+        if (!exists) return send_error(req, "404 Not Found", "no such file");
+        anim_stop();   // the player might have it open
+        if ((S_ISDIR(st.st_mode) ? rmdir(path) : unlink(path)) != 0) return send_error(req, "500 Internal Server Error", strerror(errno));
+        return send_ok(req);
+    }
+    // PUT: stream the body to the file
+    if (req->content_len == 0) return send_error(req, "400 Bad Request", "empty body");
+    anim_stop();
+    mkdirs(path);
+    char tmp[136];
+    snprintf(tmp, sizeof tmp, "%s.part", path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return send_error(req, "500 Internal Server Error", "can't create file (does the volume exist?)");
+    char *buf = malloc(8192);
+    size_t got = 0;
+    bool ok = true;
+    while (got < req->content_len) {
+        int r = httpd_req_recv(req, buf, 8192);
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r <= 0 || fwrite(buf, 1, r, f) != (size_t)r) { ok = false; break; }
+        got += r;
+    }
+    free(buf);
+    fclose(f);
+    if (!ok) { unlink(tmp); return send_error(req, "500 Internal Server Error", "write failed (disk full?)"); }
+    unlink(path);
+    rename(tmp, path);
+    ESP_LOGI(TAG, "stored %s (%u bytes)", path, (unsigned)got);
+    return send_ok(req);
+}
+
 // WebSocket: clients connect to /ws?token=... and receive events as JSON text frames.
+// Binary frames sent by the client are shown as JPEG frames (live streaming).
 static esp_err_t h_ws(httpd_req_t *req)
 {
     if (req->method == HTTP_GET) {
@@ -291,9 +438,16 @@ static esp_err_t h_ws(httpd_req_t *req)
         return ESP_OK;
     }
     httpd_ws_frame_t f = {0};
-    httpd_ws_recv_frame(req, &f, 0);   // ignore client messages (read and drop)
-    if (f.len) { uint8_t *b = malloc(f.len + 1); f.payload = b; httpd_ws_recv_frame(req, &f, f.len); free(b); }
-    return ESP_OK;
+    if (httpd_ws_recv_frame(req, &f, 0) != ESP_OK) return ESP_FAIL;
+    if (!f.len) return ESP_OK;
+    if (f.len > 512 * 1024) return ESP_FAIL;
+    uint8_t *b = heap_caps_malloc(f.len, MALLOC_CAP_SPIRAM);
+    if (!b) return ESP_ERR_NO_MEM;
+    f.payload = b;
+    esp_err_t e = httpd_ws_recv_frame(req, &f, f.len);
+    if (e == ESP_OK && f.type == HTTPD_WS_TYPE_BINARY) return anim_stream_frame(b, f.len) == ESP_OK ? ESP_OK : ESP_OK;   // takes b
+    free(b);
+    return e;
 }
 
 void api_broadcast(const char *json)
@@ -313,7 +467,8 @@ esp_err_t api_start(api_status_cb_t status_cb)
 {
     s_status_cb = status_cb;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 24;
+    cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.stack_size = 8192;
     cfg.recv_wait_timeout = 20;
     cfg.send_wait_timeout = 20;
@@ -333,6 +488,11 @@ esp_err_t api_start(api_status_cb_t status_cb)
         { .uri = "/reboot",    .method = HTTP_POST, .handler = h_reboot },
         { .uri = "/ota",       .method = HTTP_POST, .handler = h_ota },
         { .uri = "/ws",        .method = HTTP_GET,  .handler = h_ws, .is_websocket = true },
+        { .uri = "/play",      .method = HTTP_POST, .handler = h_play },
+        { .uri = "/stop",      .method = HTTP_POST, .handler = h_stop },
+        { .uri = "/files/*",   .method = HTTP_GET,  .handler = h_files },
+        { .uri = "/files/*",   .method = HTTP_PUT,  .handler = h_files },
+        { .uri = "/files/*",   .method = HTTP_DELETE, .handler = h_files },
     };
     for (size_t i = 0; i < sizeof uris / sizeof uris[0]; i++) httpd_register_uri_handler(s_server, &uris[i]);
     ESP_LOGI(TAG, "HTTP API on port 80");

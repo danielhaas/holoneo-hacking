@@ -15,6 +15,8 @@
 #include "gesture.h"
 #include "net.h"
 #include "api.h"
+#include "anim.h"
+#include "storage.h"
 
 static const char *TAG = "holoneo";
 
@@ -73,7 +75,9 @@ void app_main(void)
     display_text_centered("Holoneo", C_TITLE, 3);
     display_flush();
 
+    storage_init();   // before audio: the SD card failed to initialise after the codecs (see git log)
     if (audio_init() != ESP_OK) ESP_LOGE(TAG, "audio init failed");
+    ESP_ERROR_CHECK(anim_init());
     s_gestures = xQueueCreate(8, sizeof(gesture_t));
     if (gesture_start(board_i2c(), on_gesture, NULL) != ESP_OK) ESP_LOGE(TAG, "gesture sensor unavailable");
 
