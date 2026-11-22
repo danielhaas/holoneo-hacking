@@ -45,7 +45,7 @@ static void show_info(void)
     if (net_state() == NET_CONNECTED) {
         snprintf(buf, sizeof buf, "%s.local\n%s\n\ntoken: %s", NET_HOSTNAME, net_ip(), net_token());
     } else if (net_state() == NET_SETUP_AP) {
-        snprintf(buf, sizeof buf, "Setup: join Wi-Fi\n%s\npassword: %s\nthen http://192.168.4.1", NET_SETUP_SSID, net_token());
+        snprintf(buf, sizeof buf, "No known Wi-Fi here.\nJoin this network:\n%s\npassword: %s", NET_SETUP_SSID, net_token());
     } else {
         snprintf(buf, sizeof buf, "connecting to Wi-Fi...");
     }
@@ -110,6 +110,23 @@ void app_main(void)
                 info_until = esp_timer_get_time() + 8000000;
             }
         }
+        // While the setup network is up, keep its instructions (name + password) on the screen.
+        static net_state_t shown_state = NET_CONNECTING;
+        net_state_t ns = net_state();
+        if (ns == NET_SETUP_AP && (!info_shown || shown_state != ns)) {
+            show_info();
+            info_shown = true;
+            restore = false;
+        }
+        if (ns != shown_state) {
+            if (shown_state == NET_SETUP_AP && ns == NET_CONNECTED) {   // just set up: show the new address briefly
+                show_info();
+                info_shown = true;
+                info_until = esp_timer_get_time() + 15000000;
+            }
+            shown_state = ns;
+        }
+        if (ns == NET_SETUP_AP) info_until = esp_timer_get_time() + 1000000;
         if (info_shown && esp_timer_get_time() > info_until) {
             info_shown = false;
             if (restore) display_restore();
