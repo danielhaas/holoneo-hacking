@@ -1,3 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
+if(DEFINED ENV{HOLO_VERSION})
+    set(PROJECT_VER "$ENV{HOLO_VERSION}")
+else()
+    set(PROJECT_VER "dev")
+endif()
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(holoneo)

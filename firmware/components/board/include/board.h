@@ -35,3 +35,7 @@
 #define BOARD_SD_CLK        15
 #define BOARD_SD_CMD        7
 #define BOARD_SD_D0         4
+
+#include "driver/i2c_master.h"
+// Shared I2C bus (created on first call).
+i2c_master_bus_handle_t board_i2c(void);
