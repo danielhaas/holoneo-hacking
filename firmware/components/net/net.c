@@ -302,7 +302,10 @@ static void wifi_task(void *arg)
         if (s_state == NET_CONNECTED) {
             // stay until we lose the connection or a new network is added
             EventBits_t b = xEventGroupWaitBits(s_ev, BIT_DISCONNECTED | BIT_RESELECT, pdTRUE, pdFALSE, portMAX_DELAY);
-            if (b & BIT_RESELECT) esp_wifi_disconnect();
+            if (b & BIT_RESELECT) {
+                vTaskDelay(pdMS_TO_TICKS(1500));   // let the HTTP reply to POST /wifi go out first
+                esp_wifi_disconnect();
+            }
             if (b & BIT_DISCONNECTED) vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
