@@ -126,6 +126,11 @@ static esp_err_t h_status(httpd_req_t *req)
     cJSON_AddNumberToObject(j, "channel", ch);
     cJSON_AddNumberToObject(j, "uptime_s", esp_timer_get_time() / 1000000);
     cJSON_AddNumberToObject(j, "free_heap", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(j, "min_free_heap", heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+    static const char *reasons[] = {"unknown", "power-on", "external", "software", "panic", "interrupt-watchdog",
+                                    "task-watchdog", "other-watchdog", "deep-sleep", "brownout", "sdio"};
+    esp_reset_reason_t rr = esp_reset_reason();
+    cJSON_AddStringToObject(j, "reset_reason", rr < sizeof reasons / sizeof reasons[0] ? reasons[rr] : "other");
     cJSON_AddNumberToObject(j, "free_psram", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
     cJSON_AddNumberToObject(j, "volume", audio_get_volume());
     cJSON_AddBoolToObject(j, "playing", anim_playing());
