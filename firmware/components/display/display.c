@@ -17,7 +17,7 @@
 
 static const char *TAG = "display";
 
-#define BAND_LINES 40
+#define BAND_LINES 20   // 2 x 12.8 KB of internal DMA RAM
 
 static esp_lcd_panel_handle_t s_panel;
 static SemaphoreHandle_t s_band_free, s_mutex, s_present_lock;
